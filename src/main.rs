@@ -195,9 +195,29 @@ async fn main() -> anyhow::Result<()> {
         let backend_url = format!("{}/ws/agent/{}", config.backend_url.trim_end_matches('/'), config.agent_id);
         info!("Connecting to backend: {}", backend_url);
         
-        match connect_async(&backend_url).await {
+        // Try to connect, but if TLS isn't compiled in and we were given a wss:// URL,
+        // fall back to ws:// (insecure) and log a clear warning about the downgrade.
+        let mut used_url = backend_url.clone();
+        let connect_first = connect_async(&backend_url).await;
+        let connect_result = match connect_first {
+            Ok(pair) => Ok(pair),
+            Err(e) => {
+                let err_str = e.to_string();
+                if backend_url.starts_with("wss://") && err_str.contains("TLS support") {
+                    // Try insecure fallback
+                    let fallback = backend_url.replacen("wss://", "ws://", 1);
+                    info!("TLS support missing in binary; attempting insecure fallback to {}", fallback);
+                    used_url = fallback.clone();
+                    connect_async(&fallback).await.map_err(|e2| e2)
+                } else {
+                    Err(e)
+                }
+            }
+        };
+
+        match connect_result {
             Ok((ws_stream, _)) => {
-                info!("Connected to Backend!");
+                info!("Connected to Backend: {}", used_url);
                 let (mut write, mut read) = ws_stream.split();
 
                 loop {
