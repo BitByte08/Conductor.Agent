@@ -26,19 +26,15 @@ fi
 echo "Installing system packages..."
 dnf install -y gcc make openssl-devel pkgconfig git curl which
 
-# Create a system user for conductor
-if ! id conductor >/dev/null 2>&1; then
-  echo "Creating system user 'conductor'..."
-  useradd --system --create-home --home-dir /var/lib/conductor -M conductor || true
-fi
+# NOTE: we no longer create an OS user for the service here; operators may choose to run the service under a dedicated user separately.
 
 # Ensure Rust toolchain (rustup + cargo)
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "Installing Rust toolchain (rustup) for user 'conductor'..."
-  # Run rustup installer as the conductor user to populate /var/lib/conductor/.cargo
-  su -s /bin/bash conductor -c "curl https://sh.rustup.rs -sSf | sh -s -- -y"
-  # Add cargo to PATH for current script execution (rustup default installs to /home/<user>/.cargo/bin, conductor's home dir is /var/lib/conductor)
-  export PATH="/var/lib/conductor/.cargo/bin:$PATH"
+  echo "Installing Rust toolchain (rustup)..."
+  # Install rustup non-interactively for the current effective user (typically root when run via sudo)
+  curl https://sh.rustup.rs -sSf | sh -s -- -y
+  # Add cargo to PATH for current script execution (rustup installs to $HOME/.cargo/bin)
+  export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
 # Build the agent

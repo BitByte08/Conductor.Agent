@@ -3,8 +3,7 @@ Description=Conductor Agent (instance %i)
 After=network.target
 
 [Service]
-User=conductor
-Group=conductor
+# Running as root by default; if you prefer a dedicated user, create it and set User= and Group= accordingly.
 WorkingDirectory=/var/lib/conductor/%i
 Environment="HOME=/var/lib/conductor/%i"
 ExecStart=/usr/local/bin/conductor-agent
