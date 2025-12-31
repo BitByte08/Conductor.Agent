@@ -1,0 +1,21 @@
+[Unit]
+Description=Conductor Agent (instance %i)
+After=network.target
+
+[Service]
+User=conductor
+Group=conductor
+WorkingDirectory=/var/lib/conductor/%i
+Environment="HOME=/var/lib/conductor/%i"
+ExecStart=/usr/local/bin/conductor-agent
+Restart=on-failure
+RestartSec=5
+# Resource limits
+LimitNOFILE=65536
+# Basic sandboxing
+PrivateTmp=true
+ProtectSystem=full
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
