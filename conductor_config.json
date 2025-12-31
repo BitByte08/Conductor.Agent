@@ -1,0 +1,5 @@
+{
+  "ram_mb": "4G",
+  "agent_id": "c643433c-2f5e-4fcf-856e-5a81d7f94cbf",
+  "backend_url": "ws://127.0.0.1:8000"
+}
