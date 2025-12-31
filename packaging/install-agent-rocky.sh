@@ -72,7 +72,7 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   "backend_url": "ws://conductor.bitworkspace.kr"
 }
 EOF
-  chown conductor:conductor "$CONFIG_FILE"
+  chown "$USER":"$USER" "$CONFIG_FILE"
 fi
 
 # Install systemd unit (copy from script directory so script is self-contained)
