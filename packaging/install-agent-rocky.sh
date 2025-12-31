@@ -50,6 +50,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo "cargo not found in PATH after rustup installation"
   exit 1
 fi
+cargo clean
 cargo build --release
 
 # Install binary
