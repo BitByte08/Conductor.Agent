@@ -2,11 +2,13 @@ use tokio::process::{Command, Child, ChildStdin};
 use tokio::io::{AsyncBufReadExt, BufReader, AsyncWriteExt};
 use std::process::Stdio;
 use tokio::sync::mpsc;
-use log::info;
+use log::{info, error};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub struct ServerProcess {
-    child: Option<Child>,
-    stdin: Option<ChildStdin>,
+    child: Option<Arc<Mutex<Child>>>,
+    stdin: Option<Arc<Mutex<ChildStdin>>>,
 }
 
 #[derive(Debug)]
@@ -51,12 +53,17 @@ impl ServerProcess {
 
         info!("Starting server with JVM: {:?} and Program: {:?}", jvm_args, prog_args);
 
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        // If jar_path is an absolute path, run in its parent directory so the server picks up eula.txt, world/, etc.
+        let jar_path_buf = std::path::PathBuf::from(jar_path);
+        let cwd = jar_path_buf.parent().map(|p| p.to_path_buf()).unwrap_or(std::path::PathBuf::from(home).join("conductor"));
+
         let mut child = Command::new("java")
             .args(jvm_args)
             .arg("-jar")
             .arg(jar_path)
             .args(prog_args)
-            .current_dir("minecraft") // Run in minecraft/ subdir
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()) // Capture stderr too
@@ -64,13 +71,11 @@ impl ServerProcess {
 
         let stdin = child.stdin.take().ok_or(anyhow::anyhow!("Failed to capture stdin"))?;
         let stdout = child.stdout.take().ok_or(anyhow::anyhow!("Failed to capture stdout"))?;
-        
-        // Spawn capture task
         let stderr = child.stderr.take().ok_or(anyhow::anyhow!("Failed to capture stderr"))?;
-        
+
         // Spawn capture task for stdout
         let tx = event_tx.clone();
-        tokio::spawn(async move {
+        let stdout_task = tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -80,7 +85,7 @@ impl ServerProcess {
 
         // Spawn capture task for stderr
         let tx_err = event_tx.clone();
-        tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -88,24 +93,39 @@ impl ServerProcess {
             }
         });
 
-        self.child = Some(child);
-        self.stdin = Some(stdin);
-        
-        // Spawn waiter task to detect actual exit
-        // Note: we can't easily wait on self.child because we need mutable access to it to kill it later.
-        // For simple MVP we rely on the main loop checking wait_zero? Or just stdout closing.
-        // Ideally we'd wrap child in an Arc<Mutex> or pass it to a manager task, but let's keep it simple for now.
+        // Wrap child and stdin in Arc<Mutex> so we can await/kill from other tasks
+        let child_arc = Arc::new(Mutex::new(child));
+        let stdin_arc = Arc::new(Mutex::new(stdin));
+
+        // Spawn waiter to detect exit
+        let tx_wait = event_tx.clone();
+        let child_clone = child_arc.clone();
+        tokio::spawn(async move {
+            let mut guard = child_clone.lock().await;
+            match guard.wait().await {
+                Ok(status) => {
+                    let code = status.code();
+                    let _ = tx_wait.send(ServerEvent::Output(format!("Server exited with status: {:?}", code))).await;
+                    let _ = tx_wait.send(ServerEvent::Exit(code)).await;
+                }
+                Err(e) => {
+                    let _ = tx_wait.send(ServerEvent::Output(format!("Server wait error: {}", e))).await;
+                    let _ = tx_wait.send(ServerEvent::Exit(None)).await;
+                }
+            }
+        });
+
+        self.child = Some(child_arc);
+        self.stdin = Some(stdin_arc);
 
         Ok(())
     }
 
     pub async fn stop(&mut self) -> anyhow::Result<()> {
-        if let Some(mut child) = self.child.take() {
+        if let Some(child_arc) = self.child.take() {
             info!("Stopping server...");
-            // Try graceful stop first?
-            // self.write_command("stop").await?; 
-            // For now, just kill or send SIGTERM if we could.
-            child.kill().await?; 
+            let mut guard = child_arc.lock().await;
+            guard.kill().await?;
             self.stdin = None;
             info!("Server stopped.");
         }
@@ -113,9 +133,10 @@ impl ServerProcess {
     }
 
     pub async fn write_command(&mut self, cmd: &str) -> anyhow::Result<()> {
-        if let Some(stdin) = &mut self.stdin {
-            stdin.write_all(format!("{}\n", cmd).as_bytes()).await?;
-            stdin.flush().await?;
+        if let Some(stdin_arc) = &self.stdin {
+            let mut guard = stdin_arc.lock().await;
+            guard.write_all(format!("{}\n", cmd).as_bytes()).await?;
+            guard.flush().await?;
             Ok(())
         } else {
             Err(anyhow::anyhow!("Server not running (no stdin)"))

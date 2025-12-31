@@ -45,9 +45,9 @@ enum BackendMessage {
     WriteProperties { properties: std::collections::HashMap<String, String> },
 }
 
-async fn read_server_properties() -> anyhow::Result<std::collections::HashMap<String, String>> {
-    let path = "minecraft/server.properties";
-    if !std::path::Path::new(path).exists() {
+async fn read_server_properties(base_dir: &str) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let path = format!("{}/server.properties", base_dir);
+    if !std::path::Path::new(&path).exists() {
         let default_props = r#"#Minecraft server properties
 #Thu Jan 01 00:00:00 UTC 2026
 spawn-protection=16
@@ -91,7 +91,7 @@ use-native-transport=true
 motd=A Minecraft Server
 enable-rcon=false
 "#;
-        tokio::fs::write(path, default_props).await?;
+        tokio::fs::write(path.clone(), default_props).await?;
     }
 
     let content = tokio::fs::read_to_string(path).await?;
@@ -104,7 +104,7 @@ enable-rcon=false
     Ok(props)
 }
 
-async fn write_server_properties(props: std::collections::HashMap<String, String>) -> anyhow::Result<()> {
+async fn write_server_properties(props: std::collections::HashMap<String, String>, base_dir: &str) -> anyhow::Result<()> {
     // We want to preserve comments if possible, but for MVP we might validly overwrite.
     // Let's just overwrite for now to ensure consistency.
     let mut content = String::from("# Minecraft server properties\n# (File overwritten by Conductor)\n");
@@ -117,7 +117,8 @@ async fn write_server_properties(props: std::collections::HashMap<String, String
         content.push_str(&format!("{}={}\n", key, value));
     }
     
-    tokio::fs::write("minecraft/server.properties", content).await?;
+    let path = format!("{}/server.properties", base_dir);
+    tokio::fs::write(path, content).await?;
     Ok(())
 }
 
@@ -162,7 +163,11 @@ async fn main() -> anyhow::Result<()> {
     // Let's keep metadata in root for now to avoid complexity of migration, 
     // unless we change installer to write to minecraft/.
     
-    let mut metadata: installer::ServerMetadata = match tokio::fs::read_to_string("conductor_metadata.json").await {
+    // Load metadata from agent-specific base dir if present
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let base = format!("{}/conductor/{}", home, config.agent_id);
+    let metadata_path = format!("{}/conductor_metadata.json", base);
+    let mut metadata: installer::ServerMetadata = match tokio::fs::read_to_string(&metadata_path).await {
         Ok(s) => serde_json::from_str(&s).unwrap_or(installer::ServerMetadata { server_type: "Unknown".into(), version: "?".into() }),
         Err(_) => installer::ServerMetadata { server_type: "Unknown".into(), version: "?".into() },
     };
@@ -204,11 +209,16 @@ async fn main() -> anyhow::Result<()> {
                     let used_mem = sys.used_memory();
                     let server_status = if server.is_running() { "ONLINE" } else { "OFFLINE" };
 
-                    // Reload metadata if changed
-                    if let Ok(s) = tokio::fs::read_to_string("conductor_metadata.json").await {
-                         if let Ok(m) = serde_json::from_str(&s) {
-                             metadata = m;
-                         }
+                    // Reload metadata from agent-specific base dir if changed
+                    {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                        let base = format!("{}/conductor/{}", home, config.agent_id);
+                        let meta_path = format!("{}/conductor_metadata.json", base);
+                        if let Ok(s) = tokio::fs::read_to_string(&meta_path).await {
+                            if let Ok(m) = serde_json::from_str(&s) {
+                                metadata = m;
+                            }
+                        }
                     }
 
                     // Reload config if changed
@@ -246,6 +256,13 @@ async fn main() -> anyhow::Result<()> {
                                     });
                                     info!("Server: {}", line); // Mirror to local terminal
                                     if let Err(_) = write.send(Message::Text(msg.to_string().into())).await { break; }
+                                }
+                                ServerEvent::Exit(code) => {
+                                    let _ = write.send(Message::Text(serde_json::json!({
+                                        "type": "SERVER_EXIT",
+                                        "payload": { "code": code }
+                                    }).to_string().into())).await;
+                                    let _ = write.send(Message::Text(serde_json::json!({ "type": "LOG", "payload": { "line": format!("Server exited: {:?}", code) } }).to_string().into())).await;
                                 }
                                 _ => {}
                             }
@@ -297,16 +314,75 @@ async fn main() -> anyhow::Result<()> {
                                     if let Ok(cmd) = serde_json::from_str::<BackendMessage>(&text) {
                                         info!("Received command: {:?}", cmd);
                                         match cmd {
-                                            BackendMessage::StartServer { jar_path } => {
+                                            BackendMessage::StartServer { jar_path: _ } => {
                                                 let mut args = vec!["nogui".into()];
                                                 if !config.ram_mb.is_empty() {
                                                     args.insert(0, format!("-Xmx{}", config.ram_mb));
                                                     args.insert(0, format!("-Xms{}", config.ram_mb));
                                                 }
-                                                if let Err(e) = server.start(&jar_path, args, server_tx.clone()).await {
+                                                // Always run the server.jar from $HOME/conductor/<agent_id>/server.jar
+                                                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                                                let base = format!("{}/conductor/{}", home, config.agent_id);
+                                                let jar_full = format!("{}/server.jar", base);
+
+                                                // Debug: ensure eula exists and log contents
+                                                let eula_path = format!("{}/eula.txt", base);
+                                                match tokio::fs::read_to_string(&eula_path).await {
+                                                    Ok(content) => {
+                                                        let _ = server_tx.clone().send(ServerEvent::Output(format!("EULA file found: {}", eula_path))).await;
+                                                        let _ = server_tx.clone().send(ServerEvent::Output(format!("EULA content: {}", content.trim()))).await;
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = server_tx.clone().send(ServerEvent::Output(format!("EULA missing or unreadable ({}) : {}", eula_path, e))).await;
+                                                    }
+                                                }
+
+                                                // Pre-check port availability from server.properties
+                                                match read_server_properties(&base).await {
+                                                    Ok(props) => {
+                                                        let port = props.get("server-port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(25565);
+                                                        // Try IPv4 and IPv6 binds to detect if port is already in use
+                                                        let mut busy = false;
+                                                        match std::net::TcpListener::bind(("0.0.0.0", port)) {
+                                                            Ok(listener) => { drop(listener); }
+                                                            Err(e) => {
+                                                                if e.kind() == std::io::ErrorKind::AddrInUse {
+                                                                    busy = true;
+                                                                } else {
+                                                                    // Not a bind-in-use error, log but don't treat as busy
+                                                                    let _ = server_tx.clone().send(ServerEvent::Output(format!("Port check (IPv4) error for {}: {}", port, e))).await;
+                                                                }
+                                                            }
+                                                        }
+                                                        if !busy {
+                                                            match std::net::TcpListener::bind(("::", port)) {
+                                                                Ok(listener) => { drop(listener); }
+                                                                Err(e) => {
+                                                                    if e.kind() == std::io::ErrorKind::AddrInUse {
+                                                                        busy = true;
+                                                                    } else {
+                                                                        // IPv6 may not be available; ignore non-AddrInUse errors here
+                                                                        let _ = server_tx.clone().send(ServerEvent::Output(format!("Port check (IPv6) error for {}: {}", port, e))).await;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        if busy {
+                                                            let _ = server_tx.clone().send(ServerEvent::Output(format!("Failed to start: port {} is in use" , port))).await;
+                                                            // don't attempt to start the server if the port is unavailable
+                                                            continue;
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        let _ = server_tx.clone().send(ServerEvent::Output("No server.properties found; assuming default port 25565".into())).await;
+                                                    }
+                                                }
+
+                                                if let Err(e) = server.start(&jar_full, args, server_tx.clone()).await {
                                                     error!("Failed to start server: {}", e);
                                                 }
                                             },
+
                                             BackendMessage::StopServer => { let _ = server.stop().await; },
                                             BackendMessage::Command { command } => {
                                                 if let Err(e) = server.write_command(&command).await {
@@ -319,36 +395,49 @@ async fn main() -> anyhow::Result<()> {
                                                 tokio::fs::write("conductor_config.json", json).await?;
                                             },
                                             BackendMessage::ReadProperties => {
-                                                 if let Ok(props) = read_server_properties().await {
+                                                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                                                let base = format!("{}/conductor/{}", home, config.agent_id);
+                                                 if let Ok(props) = read_server_properties(&base).await {
                                                     let msg = serde_json::json!({ "type": "PROPERTIES", "payload": props });
                                                     let _ = write.send(Message::Text(msg.to_string().into())).await;
                                                 }
                                             },
                                             BackendMessage::WriteProperties { properties } => {
-                                                let _ = write_server_properties(properties).await;
+                                                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                                                let base = format!("{}/conductor/{}", home, config.agent_id);
+                                                let _ = write_server_properties(properties, &base).await;
                                             },
                                             BackendMessage::InstallServer { url, filename, server_type, version } => {
                                                 let url_clone = url.clone();
                                                 let filename_clone = filename.clone();
                                                 let type_clone = server_type.clone();
                                                 let ver_clone = version.clone();
+                                                let agent_id_clone = config.agent_id.clone();
                                                 let tx = server_tx.clone();
                                                 tokio::spawn(async move {
                                                     let _ = tx.send(ServerEvent::Output(format!("Starting download of {}...", url_clone))).await;
                                                     
-                                                    // INSTALL TARGET: minecraft/server.jar
-                                                    let target_path = format!("minecraft/{}", filename_clone);
+                                                    // INSTALL TARGET: $HOME/conductor/<agent_id>/server.jar
+                                                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                                                    let base = format!("{}/conductor/{}", home, agent_id_clone);
+                                                    let target_path = format!("{}/server.jar", base);
                                                     
                                                     match installer::download_file(&url_clone, &target_path).await {
                                                         Ok(_) => {
                                                             let _ = tx.send(ServerEvent::Output("Download successful. Accepting EULA...".into())).await;
-                                                            if let Err(e) = installer::accept_eula("minecraft").await {
+                                                            if let Err(e) = installer::accept_eula(&base).await {
                                                                 let _ = tx.send(ServerEvent::Output(format!("Failed to accept EULA: {}", e))).await;
                                                             } else {
                                                                 let _ = tx.send(ServerEvent::Output("EULA accepted.".into())).await;
                                                             }
-                                                            if let Err(e) = installer::create_metadata_file(&type_clone, &ver_clone).await {
+                                                            if let Err(e) = installer::create_metadata_file(&type_clone, &ver_clone, &base).await {
                                                                 let _ = tx.send(ServerEvent::Output(format!("Failed to create metadata: {}", e))).await;
+                                                            } else {
+                                                                // Notify frontend about metadata so overview can update
+                                                                let _ = tx.send(ServerEvent::Output(format!("METADATA: {} {}", type_clone, ver_clone))).await;
+                                                            }
+                                                            if let Err(e) = installer::create_default_server_files(&base).await {
+                                                                let _ = tx.send(ServerEvent::Output(format!("Failed to create default server files: {}", e))).await;
                                                             }
                                                             let _ = tx.send(ServerEvent::Output("Installation complete! You can now start the server.".into())).await;
                                                         },
@@ -361,11 +450,14 @@ async fn main() -> anyhow::Result<()> {
                                             BackendMessage::InstallMod { url, filename } => {
                                                 let url_clone = url.clone();
                                                 let filename_clone = filename.clone();
+                                                let agent_id_clone = config.agent_id.clone();
                                                 let tx = server_tx.clone();
                                                 tokio::spawn(async move {
                                                     let _ = tx.send(ServerEvent::Output(format!("Installing mod from {}...", url_clone))).await;
-                                                    // Mods go to minecraft/mods/
-                                                    if let Err(e) = installer::install_mod(&url_clone, &filename_clone, "minecraft/mods").await {
+                                                    // Mods go to $HOME/conductor/<agent_id>/mods
+                                                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                                                    let base = format!("{}/conductor/{}", home, agent_id_clone);
+                                                    if let Err(e) = installer::install_mod(&url_clone, &filename_clone, &base).await {
                                                         let _ = tx.send(ServerEvent::Output(format!("Failed to install mod: {}", e))).await;
                                                     } else {
                                                         let _ = tx.send(ServerEvent::Output(format!("Mod installed: {}", filename_clone))).await;
