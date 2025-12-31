@@ -59,7 +59,8 @@ install -m 755 target/release/conductor-agent /usr/local/bin/conductor-agent
 # Prepare data dir for this agent
 DATA_DIR="/var/lib/conductor/${AGENT_ID}"
 mkdir -p "$DATA_DIR"
-chown -R conductor:conductor /var/lib/conductor
+# Set ownership to the current user (caller). Using $USER as requested.
+chown -R "$USER":"$USER" /var/lib/conductor
 
 # Create a simple config file for this agent if missing
 CONFIG_FILE="$DATA_DIR/conductor_config.json"
