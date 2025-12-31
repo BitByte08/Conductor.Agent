@@ -69,7 +69,7 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 {
   "ram_mb": "4G",
   "agent_id": "${AGENT_ID}",
-  "backend_url": "ws://conductor.bitworkspace.kr"
+  "backend_url": "wss://conductor.bitworkspace.kr"
 }
 EOF
   chown "$USER":"$USER" "$CONFIG_FILE"
