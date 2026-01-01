@@ -5,7 +5,10 @@ use tokio::sync::mpsc;
 use sysinfo::{System, RefreshKind, CpuRefreshKind, MemoryRefreshKind};
 use tokio::time::{sleep, Duration};
 use log::{info, error, warn};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{connect_async, connect_async_tls_with_config, tungstenite::protocol::Message, Connector};
+use rustls;
+use rustls_native_certs;
+use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 
@@ -122,8 +125,36 @@ async fn write_server_properties(props: std::collections::HashMap<String, String
     Ok(())
 }
 
+fn make_tls_connector() -> anyhow::Result<tokio_tungstenite::Connector> {
+    // Load root certificates from the platform trust store
+    info!("Loading native root certificates...");
+    let certs = rustls_native_certs::load_native_certs()?;
+    info!("Loaded {} root certificates", certs.len());
+    
+    let mut root_store = rustls::RootCertStore::empty();
+    for (i, cert) in certs.into_iter().enumerate() {
+        match root_store.add(cert) {
+            Ok(_) => {},
+            Err(e) => {
+                warn!("Failed to add certificate {}: {}", i, e);
+            }
+        }
+    }
+    info!("Root certificate store ready with {} certs", root_store.len());
+
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    info!("TLS connector created successfully");
+    Ok(tokio_tungstenite::Connector::Rustls(Arc::new(client_config)))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Initialize rustls with ring crypto provider
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     info!("Starting Conductor Agent...");
 
@@ -176,17 +207,32 @@ async fn main() -> anyhow::Result<()> {
     let mut server = ServerProcess::new();
     let (server_tx, mut server_rx) = mpsc::channel::<ServerEvent>(100);
 
-    // Stdin Handler
+    // Stdin Handler - ignore EOF/pipe closure
     let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(100);
     tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let stdin = tokio::io::stdin();
         let mut reader = BufReader::new(stdin);
         let mut line = String::new();
-        while let Ok(n) = reader.read_line(&mut line).await {
-            if n == 0 { break; }
-            let _ = stdin_tx.send(line.trim().to_string()).await;
-            line.clear();
+        loop {
+            match reader.read_line(&mut line).await {
+                Ok(0) => {
+                    // EOF - keep running, just don't read anymore
+                    info!("Stdin closed (running in background)");
+                    break;
+                }
+                Ok(_) => {
+                    let trimmed = line.trim().to_string();
+                    if !trimmed.is_empty() {
+                        let _ = stdin_tx.send(trimmed).await;
+                    }
+                    line.clear();
+                }
+                Err(_) => {
+                    // Error reading stdin (e.g., pipe closed) - just stop reading
+                    break;
+                }
+            }
         }
     });
 
@@ -195,24 +241,40 @@ async fn main() -> anyhow::Result<()> {
         let backend_url = format!("{}/ws/agent/{}", config.backend_url.trim_end_matches('/'), config.agent_id);
         info!("Connecting to backend: {}", backend_url);
         
-        // Try to connect, but if TLS isn't compiled in and we were given a wss:// URL,
-        // fall back to ws:// (insecure) and log a clear warning about the downgrade.
-        let mut used_url = backend_url.clone();
-        let connect_first = connect_async(&backend_url).await;
-        let connect_result = match connect_first {
-            Ok(pair) => Ok(pair),
-            Err(e) => {
-                let err_str = e.to_string();
-                if backend_url.starts_with("wss://") && err_str.contains("TLS support") {
-                    // Try insecure fallback
-                    let fallback = backend_url.replacen("wss://", "ws://", 1);
-                    info!("TLS support missing in binary; attempting insecure fallback to {}", fallback);
-                    used_url = fallback.clone();
-                    connect_async(&fallback).await.map_err(|e2| e2)
-                } else {
-                    Err(e)
+        // Connect based on scheme (wss vs ws)
+        let connect_result = if backend_url.starts_with("wss://") {
+            // Use TLS connector for wss:// with system roots
+            let connector = match make_tls_connector() {
+                Ok(conn) => conn,
+                Err(e) => {
+                    error!("Failed to create TLS connector: {}", e);
+                    tokio::select! {
+                        _ = sleep(Duration::from_secs(5)) => {},
+                        Some(line) = stdin_rx.recv() => {
+                            let parts: Vec<&str> = line.split_whitespace().collect();
+                            if !parts.is_empty() && parts[0] == "set-url" && parts.len() > 1 {
+                                config.backend_url = parts[1].to_string();
+                                info!("Backend URL updated to: {}", config.backend_url);
+                                let _ = tokio::fs::write("conductor_config.json", serde_json::to_string_pretty(&config).unwrap()).await;
+                            }
+                        }
+                    }
+                    continue;
                 }
-            }
+            };
+            info!("Attempting TLS connection to: {}", backend_url);
+            let result = connect_async_tls_with_config(&backend_url, None, false, Some(connector)).await;
+            info!("TLS connection result: {:?}", result.as_ref().map(|_| "Ok").map_err(|e| format!("{:?}", e)));
+            result
+        } else {
+            // Use plain ws://
+            connect_async(&backend_url).await
+        };
+        
+        let used_url = backend_url.clone();
+        let connect_result = match connect_result {
+            Ok(pair) => Ok(pair),
+            Err(e) => Err(e)
         };
 
         match connect_result {

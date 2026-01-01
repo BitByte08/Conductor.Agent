@@ -13,5 +13,8 @@ log = "0.4"
 env_logger = "0.11"
 anyhow = "1.0"
 url = "2.5"
+# Use rustls stack with system root certs
 tokio-tungstenite = { version = "0.26", features = ["__rustls-tls"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-native-certs = "0.7"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
