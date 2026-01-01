@@ -207,10 +207,8 @@ async fn main() -> anyhow::Result<()> {
     // Let's keep metadata in root for now to avoid complexity of migration, 
     // unless we change installer to write to minecraft/.
     
-    // Load metadata from agent-specific base dir if present
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let base = format!("{}/conductor/{}", home, config.agent_id);
-    let metadata_path = format!("{}/conductor_metadata.json", base);
+    // Load metadata from current directory (systemd sets WorkingDirectory=/var/lib/conductor/<id>)
+    let metadata_path = "conductor_metadata.json";
     let mut metadata: installer::ServerMetadata = match tokio::fs::read_to_string(&metadata_path).await {
         Ok(s) => serde_json::from_str(&s).unwrap_or(installer::ServerMetadata { server_type: "Unknown".into(), version: "?".into() }),
         Err(_) => installer::ServerMetadata { server_type: "Unknown".into(), version: "?".into() },
@@ -309,15 +307,10 @@ async fn main() -> anyhow::Result<()> {
                     let used_mem = sys.used_memory();
                     let server_status = if server.is_running() { "ONLINE" } else { "OFFLINE" };
 
-                    // Reload metadata from agent-specific base dir if changed
-                    {
-                        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                        let base = format!("{}/conductor/{}", home, config.agent_id);
-                        let meta_path = format!("{}/conductor_metadata.json", base);
-                        if let Ok(s) = tokio::fs::read_to_string(&meta_path).await {
-                            if let Ok(m) = serde_json::from_str(&s) {
-                                metadata = m;
-                            }
+                    // Reload metadata from current directory
+                    if let Ok(s) = tokio::fs::read_to_string(&metadata_path).await {
+                        if let Ok(m) = serde_json::from_str(&s) {
+                            metadata = m;
                         }
                     }
 
@@ -429,13 +422,11 @@ async fn main() -> anyhow::Result<()> {
                                                     args.insert(0, format!("-Xmx{}", config.ram_mb));
                                                     args.insert(0, format!("-Xms{}", config.ram_mb));
                                                 }
-                                                // Always run the server.jar from $HOME/conductor/<agent_id>/server.jar
-                                                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                                                let base = format!("{}/conductor/{}", home, config.agent_id);
-                                                let jar_full = format!("{}/server.jar", base);
+                                                // Run server.jar from minecraft/ subdirectory
+                                                let jar_full = "minecraft/server.jar";
 
                                                 // Debug: ensure eula exists and log contents
-                                                let eula_path = format!("{}/eula.txt", base);
+                                                let eula_path = "minecraft/eula.txt";
                                                 match tokio::fs::read_to_string(&eula_path).await {
                                                     Ok(content) => {
                                                         let _ = server_tx.clone().send(ServerEvent::Output(format!("EULA file found: {}", eula_path))).await;
@@ -447,7 +438,7 @@ async fn main() -> anyhow::Result<()> {
                                                 }
 
                                                 // Pre-check port availability from server.properties
-                                                match read_server_properties(&base).await {
+                                                match read_server_properties("minecraft").await {
                                                     Ok(props) => {
                                                         let port = props.get("server-port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(25565);
                                                         // Try IPv4 and IPv6 binds to detect if port is already in use
@@ -529,9 +520,15 @@ async fn main() -> anyhow::Result<()> {
                                                 tokio::spawn(async move {
                                                     let _ = tx.send(ServerEvent::Output(format!("Starting download of {}...", url_clone))).await;
                                                     
-                                                    // INSTALL TARGET: $HOME/conductor/<agent_id>/server.jar
-                                                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                                                    let base = format!("{}/conductor/{}", home, agent_id_clone);
+                                                    // INSTALL TARGET: minecraft/server.jar in current directory
+                                                    let base = "minecraft";
+                                                    
+                                                    // Ensure minecraft directory exists
+                                                    if let Err(e) = tokio::fs::create_dir_all(&base).await {
+                                                        let _ = tx.send(ServerEvent::Output(format!("Failed to create minecraft directory: {}", e))).await;
+                                                        return;
+                                                    }
+                                                    
                                                     let target_path = format!("{}/server.jar", base);
                                                     
                                                     match installer::download_file(&url_clone, &target_path).await {
@@ -566,9 +563,8 @@ async fn main() -> anyhow::Result<()> {
                                                 let tx = server_tx.clone();
                                                 tokio::spawn(async move {
                                                     let _ = tx.send(ServerEvent::Output(format!("Installing mod from {}...", url_clone))).await;
-                                                    // Mods go to $HOME/conductor/<agent_id>/mods
-                                                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                                                    let base = format!("{}/conductor/{}", home, agent_id_clone);
+                                                    // Mods go to minecraft/mods
+                                                    let base = "minecraft";
                                                     if let Err(e) = installer::install_mod(&url_clone, &filename_clone, &base).await {
                                                         let _ = tx.send(ServerEvent::Output(format!("Failed to install mod: {}", e))).await;
                                                     } else {
