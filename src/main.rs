@@ -47,6 +47,7 @@ enum BackendMessage {
     UpdateConfig { ram_mb: String },
     ReadProperties,
     WriteProperties { properties: std::collections::HashMap<String, String> },
+    ListMods,
 }
 
 async fn read_server_properties(base_dir: &str) -> anyhow::Result<std::collections::HashMap<String, String>> {
@@ -615,6 +616,33 @@ async fn main() -> anyhow::Result<()> {
                                                     }
                                                 }
                                             },
+                                            BackendMessage::ListMods => {
+                                                let mods_dir = "minecraft/mods";
+                                                let mut files: Vec<String> = Vec::new();
+                                                match tokio::fs::read_dir(mods_dir).await {
+                                                    Ok(mut rd) => {
+                                                        while let Ok(Some(entry)) = rd.next_entry().await {
+                                                            if let Ok(ft) = entry.file_type().await {
+                                                                if ft.is_file() {
+                                                                    if let Some(name) = entry.file_name().to_str() {
+                                                                        files.push(name.to_string());
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = write.send(Message::Text(serde_json::json!({
+                                                            "type": "LOG",
+                                                            "payload": { "line": format!("Failed to read mods directory: {}", e) }
+                                                        }).to_string().into())).await;
+                                                    }
+                                                }
+                                                let _ = write.send(Message::Text(serde_json::json!({
+                                                    "type": "MODS",
+                                                    "payload": { "files": files }
+                                                }).to_string().into())).await;
+                                            }
                                             BackendMessage::InstallServer { url, filename, server_type, version } => {
                                                 let url_clone = url.clone();
                                                 let filename_clone = filename.clone();
