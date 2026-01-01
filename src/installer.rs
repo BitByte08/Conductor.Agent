@@ -60,14 +60,13 @@ pub async fn create_metadata_file(server_type: &str, version: &str, base_dir: &s
     Ok(())
 }
 
-pub async fn install_mod(url: &str, filename: &str, base_dir: &str) -> anyhow::Result<()> {
-    let base = Path::new(base_dir);
-    let mods_dir = base.join("mods");
-    if !mods_dir.exists() {
-        fs::create_dir_all(&mods_dir).await?;
+pub async fn install_mod(url: &str, filename: &str, target_dir: &str) -> anyhow::Result<()> {
+    let base = Path::new(target_dir);
+    if !base.exists() {
+        fs::create_dir_all(&base).await?;
     }
     
-    let path = mods_dir.join(filename);
+    let path = base.join(filename);
     info!("Installing mod {} to {:?}", url, path);
     
     // Re-use download logic (use string path)

@@ -44,6 +44,8 @@ enum BackendMessage {
     Command { command: String },
     InstallServer { url: String, filename: String, server_type: String, version: String },
     InstallMod { url: String, filename: String },
+    DeleteMod { filename: String },
+    ToggleMod { filename: String, enabled: bool },
     UpdateConfig { ram_mb: String },
     ReadProperties,
     WriteProperties { properties: std::collections::HashMap<String, String> },
@@ -138,6 +140,15 @@ async fn write_server_properties(props: std::collections::HashMap<String, String
     tokio::fs::write(&path, content).await?;
     info!("Successfully wrote server.properties to: {}", path);
     Ok(())
+}
+
+fn mod_dir_from_metadata(metadata: &installer::ServerMetadata) -> String {
+    let st = metadata.server_type.to_lowercase();
+    if st.contains("fabric") {
+        "minecraft/mods".to_string()
+    } else {
+        "minecraft/plugins".to_string()
+    }
 }
 
 fn make_tls_connector() -> anyhow::Result<tokio_tungstenite::Connector> {
@@ -617,15 +628,25 @@ async fn main() -> anyhow::Result<()> {
                                                 }
                                             },
                                             BackendMessage::ListMods => {
-                                                let mods_dir = "minecraft/mods";
-                                                let mut files: Vec<String> = Vec::new();
-                                                match tokio::fs::read_dir(mods_dir).await {
+                                                let mods_dir = mod_dir_from_metadata(&metadata);
+                                                if let Err(e) = tokio::fs::create_dir_all(&mods_dir).await {
+                                                    let _ = write.send(Message::Text(serde_json::json!({
+                                                        "type": "LOG",
+                                                        "payload": { "line": format!("Failed to ensure mods directory: {}", e) }
+                                                    }).to_string().into())).await;
+                                                }
+                                                let mut files: Vec<serde_json::Value> = Vec::new();
+                                                match tokio::fs::read_dir(&mods_dir).await {
                                                     Ok(mut rd) => {
                                                         while let Ok(Some(entry)) = rd.next_entry().await {
                                                             if let Ok(ft) = entry.file_type().await {
                                                                 if ft.is_file() {
                                                                     if let Some(name) = entry.file_name().to_str() {
-                                                                        files.push(name.to_string());
+                                                                        let enabled = !name.ends_with(".disabled");
+                                                                        files.push(serde_json::json!({
+                                                                            "name": name.to_string(),
+                                                                            "enabled": enabled
+                                                                        }));
                                                                     }
                                                                 }
                                                             }
@@ -640,7 +661,7 @@ async fn main() -> anyhow::Result<()> {
                                                 }
                                                 let _ = write.send(Message::Text(serde_json::json!({
                                                     "type": "MODS",
-                                                    "payload": { "files": files }
+                                                    "payload": { "files": files, "dir": mods_dir }
                                                 }).to_string().into())).await;
                                             }
                                             BackendMessage::InstallServer { url, filename, server_type, version } => {
@@ -693,16 +714,57 @@ async fn main() -> anyhow::Result<()> {
                                             BackendMessage::InstallMod { url, filename } => {
                                                 let url_clone = url.clone();
                                                 let filename_clone = filename.clone();
-                                                let agent_id_clone = config.agent_id.clone();
                                                 let tx = server_tx.clone();
+                                                let target_dir = mod_dir_from_metadata(&metadata);
                                                 tokio::spawn(async move {
                                                     let _ = tx.send(ServerEvent::Output(format!("Installing mod from {}...", url_clone))).await;
-                                                    // Mods go to minecraft/mods
-                                                    let base = "minecraft";
-                                                    if let Err(e) = installer::install_mod(&url_clone, &filename_clone, &base).await {
+                                                    if let Err(e) = installer::install_mod(&url_clone, &filename_clone, &target_dir).await {
                                                         let _ = tx.send(ServerEvent::Output(format!("Failed to install mod: {}", e))).await;
                                                     } else {
                                                         let _ = tx.send(ServerEvent::Output(format!("Mod installed: {}", filename_clone))).await;
+                                                    }
+                                                });
+                                            }
+                                            BackendMessage::DeleteMod { filename } => {
+                                                let dir = mod_dir_from_metadata(&metadata);
+                                                let path = format!("{}/{}", dir, filename);
+                                                let tx = server_tx.clone();
+                                                tokio::spawn(async move {
+                                                    match tokio::fs::remove_file(&path).await {
+                                                        Ok(_) => {
+                                                            let _ = tx.send(ServerEvent::Output(format!("Deleted mod/plugin: {}", filename))).await;
+                                                        }
+                                                        Err(e) => {
+                                                            let _ = tx.send(ServerEvent::Output(format!("Failed to delete {}: {}", filename, e))).await;
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                            BackendMessage::ToggleMod { filename, enabled } => {
+                                                let dir = mod_dir_from_metadata(&metadata);
+                                                let tx = server_tx.clone();
+                                                tokio::spawn(async move {
+                                                    let base_path = format!("{}/{}", dir, filename.trim_end_matches(".disabled"));
+                                                    if enabled {
+                                                        let disabled_path = format!("{}.disabled", base_path);
+                                                        match tokio::fs::rename(&disabled_path, &base_path).await {
+                                                            Ok(_) => {
+                                                                let _ = tx.send(ServerEvent::Output(format!("Enabled {}", filename))).await;
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = tx.send(ServerEvent::Output(format!("Failed to enable {}: {}", filename, e))).await;
+                                                            }
+                                                        }
+                                                    } else {
+                                                        let disabled_path = format!("{}.disabled", base_path);
+                                                        match tokio::fs::rename(&base_path, &disabled_path).await {
+                                                            Ok(_) => {
+                                                                let _ = tx.send(ServerEvent::Output(format!("Disabled {}", filename))).await;
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = tx.send(ServerEvent::Output(format!("Failed to disable {}: {}", filename, e))).await;
+                                                            }
+                                                        }
                                                     }
                                                 });
                                             }
