@@ -65,7 +65,8 @@ impl ServerProcess {
     }
 
     pub fn is_running(&self) -> bool {
-        self.child.is_some()
+        // Check both child handle and recovered PID
+        self.child.is_some() || self.pid.is_some()
     }
 
     pub async fn start(&mut self, jar_path: &str, args: Vec<String>, event_tx: mpsc::Sender<ServerEvent>) -> anyhow::Result<()> {
@@ -193,7 +194,8 @@ impl ServerProcess {
             // Wait up to 10 seconds for graceful shutdown
             for i in 0..10 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                if self.child.is_none() {
+                // Check if both child and pid are cleared
+                if !self.is_running() {
                     info!("Server stopped gracefully after {} seconds", i + 1);
                     Self::remove_pid_file().await?;
                     return Ok(());
@@ -203,6 +205,15 @@ impl ServerProcess {
         }
         
         self.stop().await
+    }
+    
+    pub async fn cleanup_on_exit(&mut self) {
+        // Called when ServerEvent::Exit is received
+        self.child = None;
+        self.stdin = None;
+        self.pid = None;
+        let _ = Self::remove_pid_file().await;
+        info!("Server process cleaned up after exit");
     }
 
     pub async fn stop(&mut self) -> anyhow::Result<()> {

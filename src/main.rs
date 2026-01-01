@@ -360,6 +360,9 @@ async fn main() -> anyhow::Result<()> {
                                     if let Err(_) = write.send(Message::Text(msg.to_string().into())).await { break; }
                                 }
                                 ServerEvent::Exit(code) => {
+                                    // Clean up server state on exit
+                                    server.cleanup_on_exit().await;
+                                    
                                     let _ = write.send(Message::Text(serde_json::json!({
                                         "type": "SERVER_EXIT",
                                         "payload": { "code": code }
@@ -483,7 +486,9 @@ async fn main() -> anyhow::Result<()> {
                                                 }
                                             },
 
-                                            BackendMessage::StopServer => { let _ = server.stop().await; },
+                                            BackendMessage::StopServer => { 
+                                                let _ = server.graceful_stop().await; 
+                                            },
                                             BackendMessage::Command { command } => {
                                                 if let Err(e) = server.write_command(&command).await {
                                                     error!("Failed to write command: {}", e);
