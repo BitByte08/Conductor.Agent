@@ -669,10 +669,10 @@ async fn main() -> anyhow::Result<()> {
                                                 let filename_clone = filename.clone();
                                                 let type_clone = server_type.clone();
                                                 let ver_clone = version.clone();
-                                                let agent_id_clone = config.agent_id.clone();
                                                 let tx = server_tx.clone();
                                                 tokio::spawn(async move {
-                                                    let _ = tx.send(ServerEvent::Output(format!("Starting download of {}...", url_clone))).await;
+                                                    let _ = tx.send(ServerEvent::Output(format!("Starting installation: type={}, version={}", type_clone, ver_clone))).await;
+                                                    let _ = tx.send(ServerEvent::Output(format!("Download URL: {}", url_clone))).await;
                                                     
                                                     // INSTALL TARGET: minecraft/server.jar in current directory
                                                     let base = "minecraft";
@@ -684,6 +684,7 @@ async fn main() -> anyhow::Result<()> {
                                                     }
                                                     
                                                     let target_path = format!("{}/server.jar", base);
+                                                    let _ = tx.send(ServerEvent::Output(format!("Target: {}", target_path))).await;
                                                     
                                                     match installer::download_file(&url_clone, &target_path).await {
                                                         Ok(_) => {
@@ -694,10 +695,11 @@ async fn main() -> anyhow::Result<()> {
                                                                 let _ = tx.send(ServerEvent::Output("EULA accepted.".into())).await;
                                                             }
                                                             // Save metadata in current directory (not minecraft/)
+                                                            let _ = tx.send(ServerEvent::Output(format!("Creating metadata: type={}, version={}", type_clone, ver_clone))).await;
                                                             if let Err(e) = installer::create_metadata_file(&type_clone, &ver_clone, ".").await {
                                                                 let _ = tx.send(ServerEvent::Output(format!("Failed to create metadata: {}", e))).await;
                                                             } else {
-                                                                // Notify frontend about metadata so overview can update
+                                                                let _ = tx.send(ServerEvent::Output(format!("Metadata saved successfully"))).await;
                                                                 let _ = tx.send(ServerEvent::Output(format!("METADATA: {} {}", type_clone, ver_clone))).await;
                                                             }
                                                             if let Err(e) = installer::create_default_server_files(&base).await {
