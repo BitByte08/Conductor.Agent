@@ -30,6 +30,7 @@ struct Heartbeat {
     ram_usage: u64,
     ram_total: u64,
     server_status: String,
+    server_ip: String,
     config: AgentConfig,
     metadata: String,
 }
@@ -49,8 +50,15 @@ enum BackendMessage {
 }
 
 async fn read_server_properties(base_dir: &str) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    // Ensure directory exists
+    info!("Reading server.properties from: {}", base_dir);
+    tokio::fs::create_dir_all(base_dir).await?;
+    
     let path = format!("{}/server.properties", base_dir);
+    info!("Full path: {}", path);
+    
     if !std::path::Path::new(&path).exists() {
+        info!("server.properties not found, creating default...");
         let default_props = r#"#Minecraft server properties
 #Thu Jan 01 00:00:00 UTC 2026
 spawn-protection=16
@@ -97,17 +105,22 @@ enable-rcon=false
         tokio::fs::write(path.clone(), default_props).await?;
     }
 
-    let content = tokio::fs::read_to_string(path).await?;
+    let content = tokio::fs::read_to_string(&path).await?;
     let mut props = std::collections::HashMap::new();
     for line in content.lines() {
         if let Some((key, value)) = line.split_once('=') {
             props.insert(key.trim().to_string(), value.trim().to_string());
         }
     }
+    info!("Successfully read {} properties from {}", props.len(), path);
     Ok(props)
 }
 
 async fn write_server_properties(props: std::collections::HashMap<String, String>, base_dir: &str) -> anyhow::Result<()> {
+    // Ensure directory exists
+    info!("Writing {} properties to: {}", props.len(), base_dir);
+    tokio::fs::create_dir_all(base_dir).await?;
+    
     // We want to preserve comments if possible, but for MVP we might validly overwrite.
     // Let's just overwrite for now to ensure consistency.
     let mut content = String::from("# Minecraft server properties\n# (File overwritten by Conductor)\n");
@@ -121,7 +134,8 @@ async fn write_server_properties(props: std::collections::HashMap<String, String
     }
     
     let path = format!("{}/server.properties", base_dir);
-    tokio::fs::write(path, content).await?;
+    tokio::fs::write(&path, content).await?;
+    info!("Successfully wrote server.properties to: {}", path);
     Ok(())
 }
 
@@ -321,12 +335,23 @@ async fn main() -> anyhow::Result<()> {
                          }
                     }
 
+                    // Get server IP address
+                    let server_ip = match std::process::Command::new("hostname").arg("-I").output() {
+                        Ok(output) => String::from_utf8_lossy(&output.stdout)
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        Err(_) => "unknown".to_string(),
+                    };
+
                     let heartbeat = Heartbeat {
                         type_: "HEARTBEAT".to_string(),
                         cpu_usage,
                         ram_usage: used_mem,
                         ram_total: total_mem,
                         server_status: server_status.to_string(),
+                        server_ip,
                         config: config.clone(),
                         metadata: metadata.server_type.clone() + " " + &metadata.version,
                     };
@@ -501,19 +526,37 @@ async fn main() -> anyhow::Result<()> {
                                             },
                                             BackendMessage::ReadProperties => {
                                                 // Read from minecraft/ directory where server actually runs
-                                                if let Ok(props) = read_server_properties("minecraft").await {
-                                                    let msg = serde_json::json!({ "type": "PROPERTIES", "payload": props });
-                                                    let _ = write.send(Message::Text(msg.to_string().into())).await;
-                                                } else {
-                                                    let _ = write.send(Message::Text(serde_json::json!({ 
-                                                        "type": "LOG", 
-                                                        "payload": { "line": "server.properties not found - server may not have been started yet" } 
-                                                    }).to_string().into())).await;
+                                                match read_server_properties("minecraft").await {
+                                                    Ok(props) => {
+                                                        let msg = serde_json::json!({ "type": "PROPERTIES", "payload": props });
+                                                        let _ = write.send(Message::Text(msg.to_string().into())).await;
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Failed to read server.properties: {}", e);
+                                                        let _ = write.send(Message::Text(serde_json::json!({ 
+                                                            "type": "LOG", 
+                                                            "payload": { "line": format!("Failed to read server.properties: {}", e) } 
+                                                        }).to_string().into())).await;
+                                                    }
                                                 }
                                             },
                                             BackendMessage::WriteProperties { properties } => {
                                                 // Write to minecraft/ directory where server actually runs
-                                                let _ = write_server_properties(properties, "minecraft").await;
+                                                match write_server_properties(properties, "minecraft").await {
+                                                    Ok(_) => {
+                                                        let _ = write.send(Message::Text(serde_json::json!({ 
+                                                            "type": "LOG", 
+                                                            "payload": { "line": "Server properties saved successfully" } 
+                                                        }).to_string().into())).await;
+                                                    }
+                                                    Err(e) => {
+                                                        error!("Failed to write server.properties: {}", e);
+                                                        let _ = write.send(Message::Text(serde_json::json!({ 
+                                                            "type": "LOG", 
+                                                            "payload": { "line": format!("Failed to save server.properties: {}", e) } 
+                                                        }).to_string().into())).await;
+                                                    }
+                                                }
                                             },
                                             BackendMessage::InstallServer { url, filename, server_type, version } => {
                                                 let url_clone = url.clone();
