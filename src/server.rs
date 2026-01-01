@@ -6,6 +6,7 @@ use log::{info, error, warn};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
+use rcon::Connection;
 
 pub struct ServerProcess {
     child: Option<Arc<Mutex<Child>>>,
@@ -67,6 +68,10 @@ impl ServerProcess {
     pub fn is_running(&self) -> bool {
         // Check both child handle and recovered PID
         self.child.is_some() || self.pid.is_some()
+    }
+
+    pub fn has_stdin(&self) -> bool {
+        self.stdin.is_some()
     }
 
     pub async fn start(&mut self, jar_path: &str, args: Vec<String>, event_tx: mpsc::Sender<ServerEvent>) -> anyhow::Result<()> {
@@ -232,9 +237,34 @@ impl ServerProcess {
             let mut guard = stdin_arc.lock().await;
             guard.write_all(format!("{}\n", cmd).as_bytes()).await?;
             guard.flush().await?;
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Server not running (no stdin)"))
+            return Ok(());
         }
+
+        // Fallback to RCON if enabled
+        let props = tokio::fs::read_to_string("minecraft/server.properties").await?;
+        let mut rcon_enabled = false;
+        let mut rcon_port: u16 = 25575;
+        let mut rcon_password: Option<String> = None;
+        for line in props.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') { continue; }
+            if let Some(v) = line.strip_prefix("enable-rcon=") {
+                rcon_enabled = v == "true";
+            } else if let Some(v) = line.strip_prefix("rcon.port=") {
+                if let Ok(p) = v.parse::<u16>() { rcon_port = p; }
+            } else if let Some(v) = line.strip_prefix("rcon.password=") {
+                if !v.is_empty() { rcon_password = Some(v.to_string()); }
+            }
+        }
+
+        if !rcon_enabled {
+            return Err(anyhow::anyhow!("Server running without stdin and RCON disabled"));
+        }
+
+        let password = rcon_password.ok_or_else(|| anyhow::anyhow!("RCON password not set"))?;
+        let addr = format!("127.0.0.1:{}", rcon_port);
+        let mut conn = Connection::builder().connect(&addr, password.as_str()).await?;
+        let _resp: String = conn.cmd(cmd).await?;
+        Ok(())
     }
 }

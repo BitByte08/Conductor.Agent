@@ -445,6 +445,15 @@ async fn main() -> anyhow::Result<()> {
                                         info!("Received command: {:?}", cmd);
                                         match cmd {
                                             BackendMessage::StartServer { jar_path: _ } => {
+                                                // Attempt recovery of existing PID before starting
+                                                if let Err(e) = server.try_recover().await {
+                                                    let _ = server_tx.clone().send(ServerEvent::Output(format!("Recovery check failed: {}", e))).await;
+                                                }
+                                                if server.is_running() {
+                                                    let _ = server_tx.clone().send(ServerEvent::Output("Server already running (existing PID). Stop it first.".into())).await;
+                                                    continue;
+                                                }
+
                                                 let mut args = vec!["nogui".into()];
                                                 if !config.ram_mb.is_empty() {
                                                     args.insert(0, format!("-Xmx{}", config.ram_mb));
@@ -496,9 +505,46 @@ async fn main() -> anyhow::Result<()> {
                                                             }
                                                         }
                                                         if busy {
-                                                            let _ = server_tx.clone().send(ServerEvent::Output(format!("Failed to start: port {} is in use" , port))).await;
-                                                            // don't attempt to start the server if the port is unavailable
-                                                            continue;
+                                                            let _ = server_tx.clone().send(ServerEvent::Output(format!("Failed to start: port {} is in use. Attempting recovery..." , port))).await;
+
+                                                            // Try to recover a previously running server via PID file and stop it
+                                                            if let Err(e) = server.try_recover().await {
+                                                                let _ = server_tx.clone().send(ServerEvent::Output(format!("Recovery failed while checking port {}: {}", port, e))).await;
+                                                            }
+
+                                                            if server.is_running() {
+                                                                let _ = server_tx.clone().send(ServerEvent::Output(format!("Found running server (PID) while port {} busy, sending stop...", port))).await;
+                                                                let _ = server.graceful_stop().await;
+                                                                sleep(Duration::from_secs(3)).await;
+                                                            }
+
+                                                            // Re-check port after attempted stop
+                                                            let mut still_busy = false;
+                                                            match std::net::TcpListener::bind(("0.0.0.0", port)) {
+                                                                Ok(listener) => { drop(listener); }
+                                                                Err(e) => {
+                                                                    if e.kind() == std::io::ErrorKind::AddrInUse {
+                                                                        still_busy = true;
+                                                                    }
+                                                                }
+                                                            }
+                                                            if !still_busy {
+                                                                match std::net::TcpListener::bind(("::", port)) {
+                                                                    Ok(listener) => { drop(listener); }
+                                                                    Err(e) => {
+                                                                        if e.kind() == std::io::ErrorKind::AddrInUse {
+                                                                            still_busy = true;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+
+                                                            if still_busy {
+                                                                let _ = server_tx.clone().send(ServerEvent::Output(format!("Failed to start: port {} is still in use after recovery. Stop the other process or change server-port.", port))).await;
+                                                                continue;
+                                                            } else {
+                                                                let _ = server_tx.clone().send(ServerEvent::Output(format!("Port {} freed after recovery. Continuing start...", port))).await;
+                                                            }
                                                         }
                                                     }
                                                     Err(_) => {
@@ -515,8 +561,16 @@ async fn main() -> anyhow::Result<()> {
                                                 let _ = server.graceful_stop().await; 
                                             },
                                             BackendMessage::Command { command } => {
-                                                if let Err(e) = server.write_command(&command).await {
-                                                    error!("Failed to write command: {}", e);
+                                                if !server.is_running() {
+                                                    let _ = server_tx.clone().send(ServerEvent::Output("Server not running (cannot send command)".into())).await;
+                                                    continue;
+                                                }
+                                                match server.write_command(&command).await {
+                                                    Ok(_) => {}
+                                                    Err(e) => {
+                                                        error!("Failed to write command: {}", e);
+                                                        let _ = server_tx.clone().send(ServerEvent::Output(format!("Failed to send command: {}", e))).await;
+                                                    }
                                                 }
                                             },
                                             BackendMessage::UpdateConfig { ram_mb } => {
