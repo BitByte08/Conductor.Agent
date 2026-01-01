@@ -544,7 +544,8 @@ async fn main() -> anyhow::Result<()> {
                                                             } else {
                                                                 let _ = tx.send(ServerEvent::Output("EULA accepted.".into())).await;
                                                             }
-                                                            if let Err(e) = installer::create_metadata_file(&type_clone, &ver_clone, &base).await {
+                                                            // Save metadata in current directory (not minecraft/)
+                                                            if let Err(e) = installer::create_metadata_file(&type_clone, &ver_clone, ".").await {
                                                                 let _ = tx.send(ServerEvent::Output(format!("Failed to create metadata: {}", e))).await;
                                                             } else {
                                                                 // Notify frontend about metadata so overview can update
