@@ -96,10 +96,8 @@ impl ServerProcess {
 
         info!("Starting server with JVM: {:?} and Program: {:?}", jvm_args, prog_args);
 
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        // If jar_path is an absolute path, run in its parent directory so the server picks up eula.txt, world/, etc.
-        let jar_path_buf = std::path::PathBuf::from(jar_path);
-        let cwd = jar_path_buf.parent().map(|p| p.to_path_buf()).unwrap_or(std::path::PathBuf::from(home).join("conductor"));
+        // Always run from minecraft/ directory so server.properties, world/, etc. are in the right place
+        let cwd = std::path::PathBuf::from("minecraft");
 
         let mut child = Command::new("java")
             .args(jvm_args)

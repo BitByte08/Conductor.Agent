@@ -425,8 +425,8 @@ async fn main() -> anyhow::Result<()> {
                                                     args.insert(0, format!("-Xmx{}", config.ram_mb));
                                                     args.insert(0, format!("-Xms{}", config.ram_mb));
                                                 }
-                                                // Run server.jar from minecraft/ subdirectory
-                                                let jar_full = "minecraft/server.jar";
+                                                // Run server.jar - pass only filename, server.rs will set cwd to minecraft/
+                                                let jar_full = "server.jar";
 
                                                 // Debug: ensure eula exists and log contents
                                                 let eula_path = "minecraft/eula.txt";
