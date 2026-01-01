@@ -525,10 +525,13 @@ async fn main() -> anyhow::Result<()> {
                                                 tokio::fs::write("conductor_config.json", json).await?;
                                             },
                                             BackendMessage::ReadProperties => {
+                                                info!("Received READ_PROPERTIES message from backend");
                                                 // Read from minecraft/ directory where server actually runs
                                                 match read_server_properties("minecraft").await {
                                                     Ok(props) => {
+                                                        info!("Successfully read {} properties from server.properties", props.len());
                                                         let msg = serde_json::json!({ "type": "PROPERTIES", "payload": props });
+                                                        info!("Sending PROPERTIES response to backend: {} keys", props.len());
                                                         let _ = write.send(Message::Text(msg.to_string().into())).await;
                                                     }
                                                     Err(e) => {
