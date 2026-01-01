@@ -158,6 +158,19 @@ async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     info!("Starting Conductor Agent...");
 
+    // Setup signal handler for graceful shutdown
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => info!("Received SIGTERM"),
+            _ = sigint.recv() => info!("Received SIGINT"),
+        }
+        let _ = shutdown_tx.send(()).await;
+    });
+
     // Initialize system monitor settings
     let mut sys = System::new_with_specifics(
         RefreshKind::nothing()
@@ -206,6 +219,11 @@ async fn main() -> anyhow::Result<()> {
     // Server Manager State
     let mut server = ServerProcess::new();
     let (server_tx, mut server_rx) = mpsc::channel::<ServerEvent>(100);
+
+    // Attempt to recover existing server process
+    if let Err(e) = server.try_recover().await {
+        warn!("Failed to recover existing server: {}", e);
+    }
 
     // Stdin Handler - ignore EOF/pipe closure
     let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(100);
@@ -327,6 +345,15 @@ async fn main() -> anyhow::Result<()> {
                                 error!("WS Send Error: {}", e);
                                 break;
                             }
+                        }
+                        
+                        _ = shutdown_rx.recv() => {
+                            info!("Shutdown signal received, stopping server...");
+                            if let Err(e) = server.graceful_stop().await {
+                                error!("Failed to gracefully stop server: {}", e);
+                            }
+                            info!("Agent shutdown complete");
+                            return Ok(());
                         }
                         
                         Some(event) = server_rx.recv() => {

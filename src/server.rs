@@ -2,13 +2,15 @@ use tokio::process::{Command, Child, ChildStdin};
 use tokio::io::{AsyncBufReadExt, BufReader, AsyncWriteExt};
 use std::process::Stdio;
 use tokio::sync::mpsc;
-use log::{info, error};
+use log::{info, error, warn};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration};
 
 pub struct ServerProcess {
     child: Option<Arc<Mutex<Child>>>,
     stdin: Option<Arc<Mutex<ChildStdin>>>,
+    pid: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -19,7 +21,47 @@ pub enum ServerEvent {
 
 impl ServerProcess {
     pub fn new() -> Self {
-        Self { child: None, stdin: None }
+        Self { child: None, stdin: None, pid: None }
+    }
+
+    fn pid_file_path() -> String {
+        "minecraft/server.pid".to_string()
+    }
+
+    async fn write_pid(&self) -> anyhow::Result<()> {
+        if let Some(pid) = self.pid {
+            tokio::fs::write(Self::pid_file_path(), pid.to_string()).await?;
+            info!("Wrote PID {} to {}", pid, Self::pid_file_path());
+        }
+        Ok(())
+    }
+
+    async fn remove_pid_file() -> anyhow::Result<()> {
+        let path = Self::pid_file_path();
+        if tokio::fs::metadata(&path).await.is_ok() {
+            tokio::fs::remove_file(&path).await?;
+            info!("Removed PID file: {}", path);
+        }
+        Ok(())
+    }
+
+    pub async fn try_recover(&mut self) -> anyhow::Result<()> {
+        let pid_path = Self::pid_file_path();
+        if let Ok(pid_str) = tokio::fs::read_to_string(&pid_path).await {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                // Check if process exists
+                if let Ok(status) = std::process::Command::new("kill").arg("-0").arg(pid.to_string()).status() {
+                    if status.success() {
+                        info!("Recovered existing Minecraft server with PID {}", pid);
+                        self.pid = Some(pid as u32);
+                        return Ok(());
+                    }
+                }
+                warn!("PID {} in file but process not found, removing stale PID file", pid);
+                Self::remove_pid_file().await?;
+            }
+        }
+        Ok(())
     }
 
     pub fn is_running(&self) -> bool {
@@ -115,10 +157,52 @@ impl ServerProcess {
             }
         });
 
+        // Get PID before moving child
+        let pid = {
+            let guard = child_arc.lock().await;
+            guard.id()
+        };
+
         self.child = Some(child_arc);
         self.stdin = Some(stdin_arc);
+        self.pid = pid;
+        self.write_pid().await?;
 
         Ok(())
+    }
+
+    pub async fn graceful_stop(&mut self) -> anyhow::Result<()> {
+        if self.child.is_none() && self.pid.is_some() {
+            // Recovered process - kill by PID
+            info!("Killing recovered server process PID: {}", self.pid.unwrap());
+            let _ = std::process::Command::new("kill").arg(self.pid.unwrap().to_string()).status();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let _ = std::process::Command::new("kill").arg("-9").arg(self.pid.unwrap().to_string()).status();
+            self.pid = None;
+            Self::remove_pid_file().await?;
+            return Ok(());
+        }
+
+        if let Some(stdin_arc) = &self.stdin {
+            info!("Sending 'stop' command to server...");
+            let mut guard = stdin_arc.lock().await;
+            let _ = guard.write_all(b"stop\n").await;
+            let _ = guard.flush().await;
+            drop(guard);
+            
+            // Wait up to 10 seconds for graceful shutdown
+            for i in 0..10 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if self.child.is_none() {
+                    info!("Server stopped gracefully after {} seconds", i + 1);
+                    Self::remove_pid_file().await?;
+                    return Ok(());
+                }
+            }
+            warn!("Server did not stop gracefully, forcing kill...");
+        }
+        
+        self.stop().await
     }
 
     pub async fn stop(&mut self) -> anyhow::Result<()> {
@@ -127,6 +211,8 @@ impl ServerProcess {
             let mut guard = child_arc.lock().await;
             guard.kill().await?;
             self.stdin = None;
+            self.pid = None;
+            Self::remove_pid_file().await?;
             info!("Server stopped.");
         }
         Ok(())
