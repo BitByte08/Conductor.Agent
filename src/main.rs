@@ -504,17 +504,20 @@ async fn main() -> anyhow::Result<()> {
                                                 tokio::fs::write("conductor_config.json", json).await?;
                                             },
                                             BackendMessage::ReadProperties => {
-                                                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                                                let base = format!("{}/conductor/{}", home, config.agent_id);
-                                                 if let Ok(props) = read_server_properties(&base).await {
+                                                // Read from minecraft/ directory where server actually runs
+                                                if let Ok(props) = read_server_properties("minecraft").await {
                                                     let msg = serde_json::json!({ "type": "PROPERTIES", "payload": props });
                                                     let _ = write.send(Message::Text(msg.to_string().into())).await;
+                                                } else {
+                                                    let _ = write.send(Message::Text(serde_json::json!({ 
+                                                        "type": "LOG", 
+                                                        "payload": { "line": "server.properties not found - server may not have been started yet" } 
+                                                    }).to_string().into())).await;
                                                 }
                                             },
                                             BackendMessage::WriteProperties { properties } => {
-                                                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                                                let base = format!("{}/conductor/{}", home, config.agent_id);
-                                                let _ = write_server_properties(properties, &base).await;
+                                                // Write to minecraft/ directory where server actually runs
+                                                let _ = write_server_properties(properties, "minecraft").await;
                                             },
                                             BackendMessage::InstallServer { url, filename, server_type, version } => {
                                                 let url_clone = url.clone();
